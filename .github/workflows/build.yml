@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       kernel_branch:
-        description: 'RPi kernel branch (e.g. rpi-6.18.y)'
+        description: 'RPi kernel branch'
         required: true
         default: 'rpi-6.18.y'
       localversion:
-        description: 'Local version suffix (e.g. -v8-ebpf)'
+        description: 'Local version suffix'
         required: true
         default: '-v8-ebpf'
 
@@ -16,11 +16,20 @@ jobs:
   build-kernel:
     runs-on: ubuntu-24.04
     steps:
+      - name: 📥 Checkout config repo first
+        uses: actions/checkout@v4
+        with:
+          repository: artspark-max/rpi-kernel-ebpf
+          ref: main
+          path: config-repo
+          fetch-depth: 1
+
       - name: 📥 Checkout kernel source
         uses: actions/checkout@v4
         with:
           repository: raspberrypi/linux
           ref: ${{ github.event.inputs.kernel_branch }}
+          path: kernel-source
           fetch-depth: 1
 
       - name: 🔧 Install cross-compile deps
@@ -30,14 +39,15 @@ jobs:
             crossbuild-essential-arm64 \
             bc kmod cpio flex bison libssl-dev libncurses-dev \
             device-tree-compiler python3 rsync git
-          echo "--- Cross compiler check ---"
           aarch64-linux-gnu-gcc --version | head -1
           echo "Dependencies done"
 
       - name: ⚙️ Apply custom config with UPROBE_EVENTS
         run: |
-          # Use saved config from this repo
-          cp $GITHUB_WORKSPACE/kernel_config_rpi-v8 .config
+          cd kernel-source
+          
+          # Copy our saved config from config-repo
+          cp $GITHUB_WORKSPACE/config-repo/kernel_config_rpi-v8 .config
           
           # Enable uprobe events (key change for eBPF TLS hooking)
           sed -i 's/# CONFIG_UPROBE_EVENTS is not set/CONFIG_UPROBE_EVENTS=y/' .config
@@ -45,36 +55,26 @@ jobs:
           # Set custom version string
           sed -i "s/CONFIG_LOCALVERSION=\"-v8\"/CONFIG_LOCALVERSION=\"${{ github.event.inputs.localversion }}\"/" .config
           
-          # Verify key settings
+          # Refresh config
+          make ARCH=arm64 olddefconfig
+          
+          # Verify
           echo "=== UPROBE_EVENTS ==="
           grep CONFIG_UPROBE_EVENTS .config
-          echo "=== Other BPF related ==="
-          grep "^CONFIG_BPF" .config
+          echo "=== BPF related ==="
+          grep "^CONFIG_BPF\|CONFIG_UPROBE" .config
           echo "=== Local version ==="
           grep CONFIG_LOCALVERSION .config
-          echo "=== Lines ==="
+          echo "=== Done ==="
           wc -l .config
 
       - name: 🏗️ Build kernel Image + modules + DTBs
         run: |
+          cd kernel-source
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
           
-          # Use RPi defconfig as base, then apply our custom config
-          make bcm2711_defconfig
-          # Merge our custom config on top
-          ./scripts/kconfig/merge_config.sh -m .config $GITHUB_WORKSPACE/kernel_config_rpi-v8 2>&1 | tail -5
-          # Enable uprobe
-          sed -i 's/# CONFIG_UPROBE_EVENTS is not set/CONFIG_UPROBE_EVENTS=y/' .config
-          # Fix localversion
-          sed -i "s/CONFIG_LOCALVERSION=\"-v8\"/CONFIG_LOCALVERSION=\"${{ github.event.inputs.localversion }}\"/" .config
-          # Refresh config
-          make olddefconfig
-          
-          echo "=== Final UPROBE_EVENTS check ==="
-          grep CONFIG_UPROBE_EVENTS .config
-          
-          # Build (parallel)
+          # Build (parallel, ~20 min)
           make -j$(nproc) Image modules dtbs 2>&1 | tail -30
           
           echo "=== Build result ==="
@@ -83,13 +83,14 @@ jobs:
 
       - name: 📦 Package kernel for RPi
         run: |
+          cd kernel-source
           export ARCH=arm64
           export CROSS_COMPILE=aarch64-linux-gnu-
           
           PKG=/tmp/kernel-pkg
           mkdir -p $PKG/boot/overlays $PKG/lib/firmware
           
-          # Copy kernel Image (rename for RPi boot)
+          # Copy kernel Image (RPi8 convention = kernel8)
           cp arch/arm64/boot/Image $PKG/boot/kernel8-ebpf.img
           
           # Copy DTBs
@@ -99,12 +100,13 @@ jobs:
           # Install modules
           make INSTALL_MOD_PATH=$PKG modules_install 2>&1 | tail -5
           
-          # Save .config for reference
+          # Save config for reference
           cp .config $PKG/boot/config-6.18-ebpf
           
-          # Create version file
-          echo "Built from: ${{ github.event.inputs.kernel_branch }}" > $PKG/boot/ebpf-build-info.txt
+          # Build info
+          echo "Kernel: $(cat include/config/kernel.release)" > $PKG/boot/ebpf-build-info.txt
           echo "UPROBE_EVENTS: enabled" >> $PKG/boot/ebpf-build-info.txt
+          echo "Branch: ${{ github.event.inputs.kernel_branch }}" >> $PKG/boot/ebpf-build-info.txt
           echo "Date: $(date -u)" >> $PKG/boot/ebpf-build-info.txt
           
           # Create tarball
@@ -122,9 +124,9 @@ jobs:
           path: /tmp/rpi-kernel-ebpf.tar.gz
           retention-days: 7
 
-      - name: 📤 Upload kernel Image only (quick install)
+      - name: 📤 Upload kernel Image only
         uses: actions/upload-artifact@v4
         with:
           name: rpi-kernel-Image
-          path: arch/arm64/boot/Image
+          path: kernel-source/arch/arm64/boot/Image
           retention-days: 7
